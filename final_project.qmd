@@ -1,0 +1,313 @@
+---
+title: "STA 9713 Fall 2025 Final Project"
+author: "Craig Allen"
+date: "December 14, 2025"
+format:
+  pdf:
+    documentclass: article
+    geometry: margin=1in
+    toc: true
+    number-sections: false
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+#| label: setup
+
+# Load necessary libraries
+library(tidyverse)
+library(lubridate)
+library(PerformanceAnalytics)
+library(knitr)
+library(kableExtra)
+library(corrplot)
+library(tseries)
+library(zoo)
+library(quadprog)
+library(broom)
+
+# -----------------------------------------------------------------------------
+# USER INPUTS
+# -----------------------------------------------------------------------------
+# Placeholder for Annualized Risk-Free Rate (e.g., 0.04 for 4%)
+rf_annual <- 0.04 
+rf_monthly <- (1 + rf_annual)^(1/12) - 1
+# -----------------------------------------------------------------------------
+
+
+raw_header <- read.csv("Final Project - Data.csv", header = FALSE, nrows = 1)
+col_names <- as.character(unlist(raw_header))
+col_names[1] <- "Date" # Fix empty first header
+
+df <- read.csv("Final Project - Data.csv", skip = 2, header = FALSE)
+colnames(df) <- col_names
+
+df_clean <- df %>%
+  mutate(Date = mdy(Date)) %>%
+  mutate(across(-Date, ~ as.numeric(.) / 100)) %>% # Convert % to decimals
+  arrange(Date)
+
+# Convert to xts for PerformanceAnalytics
+df_xts <- xts(df_clean[, -1], order.by = df_clean$Date)
+
+
+part1_tickers <- c("UPRO", "VOO", "TQQQ", "VEA", "SPHY", "GLD")
+df_part1 <- na.omit(df_xts[, part1_tickers])
+
+# Part 2 Universe: All 8 ETFs (Intersection of dates)
+df_part2 <- na.omit(df_xts)
+```
+
+# Part 1: Analysis Without GOVT nor ITDB
+
+## 1\. Regression of UPRO as a function of VOO
+
+We analyze the relationship between the leveraged ETF (UPRO) and the market index (VOO) using the linear model:
+$$ R_{UPRO} = \alpha + \beta R_{VOO} + \epsilon $$
+where $\beta$ represents the sensitivity of UPRO to VOO's returns.
+
+```{r q1-regression}
+# Linear Model
+model_upro <- lm(UPRO ~ VOO, data = df_part1)
+
+
+coeffs <- tidy(model_upro) %>%
+  select(term, estimate, p.value) %>%
+  mutate(
+    term = c("Alpha (Intercept)", "Beta (VOO)"),
+    estimate = round(estimate, 2),
+    p.value = ifelse(p.value < 0.001, "< 0.001", round(p.value, 3))
+  )
+
+kable(coeffs, caption = "Regression Results: UPRO vs VOO", booktabs = T, align = "lcc") %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+**Interpretation:**
+The regression yields a Beta of **`r coeffs$estimate[2]`**. This confirms that UPRO functions as a 3x leveraged ETF, effectively tripling the daily returns of the S\&P 500 (VOO). The Alpha is near zero, indicating the fund tracks its target leverage efficiently without significant excess return or drag beyond fees/slippage over this period.
+
+-----
+
+## 2\. VaR and CVaR Analysis
+
+We calculate the Value at Risk (VaR) and Conditional Value at Risk (CVaR) at the 95% confidence level.
+
+  * **VaR (95%):** The maximum monthly loss expected with 95% confidence.
+  * **CVaR (95%):** The average monthly loss expected *if* the loss exceeds the VaR threshold.
+
+<!-- end list -->
+
+```{r q2-risk}
+# Calculate Historical VaR and CVaR
+var_95 <- VaR(df_part1[, c("UPRO", "VOO")], p = 0.95, method = "historical")
+cvar_95 <- ETL(df_part1[, c("UPRO", "VOO")], p = 0.95, method = "historical")
+
+# Combine and Format (Percentages)
+risk_table <- rbind(var_95, cvar_95) * 100
+rownames(risk_table) <- c("VaR (95%)", "CVaR (95%)")
+
+kable(round(risk_table, 2), caption = "Monthly Downside Risk (%)", booktabs = T) %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+**Commentary:**
+The numbers illustrate the cost of leverage. While UPRO offers 3x the upside, its downside risk is also roughly triple that of VOO.
+
+  * **VOO** has a 95% VaR of **`r round(risk_table[1,2], 2)`%**, meaning in 19 out of 20 months, losses shouldn't exceed this.
+  * **UPRO** has a much deeper VaR of **`r round(risk_table[1,1], 2)`%**.
+  * Crucially, the CVaR for UPRO is **`r round(risk_table[2,1], 2)`%**, suggesting that when tail events occur, UPRO investors suffer catastrophic losses compared to the broader market.
+
+-----
+
+## 3\. Correlation Matrix
+
+The table below shows the correlation structure of the 6 ETFs.
+
+```{r q3-correlation}
+cor_matrix <- cor(df_part1)
+kable(round(cor_matrix, 2), caption = "Correlation Matrix", booktabs = T) %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+**Observations:**
+The equity funds (UPRO, VOO, TQQQ, VEA) are highly correlated (\> 0.85). Diversification benefits in this subset primarily come from **GLD** (Gold) and **SPHY** (High Yield Bonds), which show significantly lower correlations to the equity block.
+
+-----
+
+## 4\. Efficient Frontier
+
+We construct the Efficient Frontier to visualize the optimal risk-return trade-offs.
+
+**Assumptions:**
+
+1.  **Long-only:** No short selling allowed ($w_i \ge 0$).
+2.  **Full Investment:** Weights sum to 100% ($\sum w_i = 1$).
+3.  **Risk Measure:** Standard Deviation of monthly returns.
+
+<!-- end list -->
+
+```{r q4-frontier}
+mu <- colMeans(df_part1)
+sigma <- cov(df_part1)
+
+
+n_points <- 50
+target_rets <- seq(min(mu), max(mu), length.out = n_points)
+risk_frontier <- numeric(n_points)
+ret_frontier <- numeric(n_points)
+
+# Loop to find min volatility for each target return
+for(i in 1:n_points) {
+  try({
+    opt <- portfolio.optim(x = df_part1, pm = target_rets[i], shorts = FALSE)
+    risk_frontier[i] <- opt$ps
+    ret_frontier[i] <- opt$pm
+  }, silent = TRUE)
+}
+
+# Remove failures (if any)
+valid <- risk_frontier > 0
+risk_frontier <- risk_frontier[valid]
+ret_frontier <- ret_frontier[valid]
+
+
+plot(risk_frontier, ret_frontier, type = "l", col = "blue", lwd = 2,
+     main = "Efficient Frontier (6 ETFs)",
+     xlab = "Monthly Risk (Std Dev)", ylab = "Monthly Expected Return",
+     xlim = c(0, max(risk_frontier)*1.2))
+grid()
+
+
+points(sqrt(diag(sigma)), mu, pch = 19, col = "red")
+text(sqrt(diag(sigma)), mu, labels = names(mu), pos = 4, cex = 0.7)
+```
+
+The curve represents the best possible returns for a given level of risk. The individual assets (red dots) generally fall below the line, proving that a diversified portfolio dominates single-asset holdings.
+
+-----
+
+## 5\. Minimum Variance Portfolio (MVP)
+
+The Minimum Variance Portfolio (MVP) is the specific combination of assets that minimizes total portfolio volatility.
+
+```{r q5-minvar}
+# Quadratic Programming Setup for Global Min Var
+n <- ncol(df_part1)
+Dmat <- 2 * sigma
+dvec <- rep(0, n)
+Amat <- cbind(rep(1, n), diag(n)) # Constraints: Sum=1, w>=0
+bvec <- c(1, rep(0, n))
+
+sol <- solve.QP(Dmat, dvec, Amat, bvec, meq = 1)
+w_mvp <- sol$solution
+names(w_mvp) <- colnames(df_part1)
+
+# Filter for significant weights
+mvp_display <- data.frame(Asset = names(w_mvp), Weight = w_mvp) %>%
+  filter(Weight > 0.001) %>%
+  mutate(Weight = scales::percent(Weight, accuracy = 0.1))
+
+kable(mvp_display, caption = "MVP Composition", booktabs = T) %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+**Commentary:**
+The solver allocates the most capital to the assets with the lowest volatilities and lowest correlations (likely **SPHY** and **GLD**). This minimizes the portfolio's overall standard deviation.
+
+\\newpage
+
+# Part 2: Including GOVT and ITDB
+
+We now introduce **GOVT** (US Treasuries) and **ITDB** (International Bonds) into the analysis.
+
+## 6\. Comparison: MVP vs. GOVT
+
+We compare the *new* Minimum Variance Portfolio (using all 8 ETFs) against holding GOVT alone.
+
+```{r q6-compare}
+# Re-calculate MVP with 8 assets
+mu2 <- colMeans(df_part2)
+sigma2 <- cov(df_part2)
+n2 <- ncol(df_part2)
+
+Dmat2 <- 2 * sigma2
+dvec2 <- rep(0, n2)
+Amat2 <- cbind(rep(1, n2), diag(n2))
+bvec2 <- c(1, rep(0, n2))
+
+sol2 <- solve.QP(Dmat2, dvec2, Amat2, bvec2, meq = 1)
+w_mvp2 <- sol2$solution
+
+# Calculate Stats
+mvp2_ret <- sum(w_mvp2 * mu2)
+mvp2_sd <- sqrt(as.numeric(t(w_mvp2) %*% sigma2 %*% w_mvp2))
+
+govt_ret <- mean(df_part2$GOVT)
+govt_sd <- sd(df_part2$GOVT)
+
+
+comp <- data.frame(
+  Metric = c("Monthly Return", "Monthly Risk (Std Dev)"),
+  `MVP (8 Assets)` = c(mvp2_ret, mvp2_sd),
+  `GOVT Standalone` = c(govt_ret, govt_sd)
+)
+
+kable(comp %>% mutate(across(where(is.numeric), ~ round(.*100, 2))), 
+      caption = "Comparison: MVP vs GOVT (%)", booktabs = T) %>%
+  kable_styling(latex_options = "hold_position")
+```
+W
+**Comparison:**
+
+  * The **MVP** achieves a risk level of **`r round(mvp2_sd*100, 2)`%**.
+  * **GOVT** has a risk level of **`r round(govt_sd*100, 2)`%**.
+  * If the MVP risk is lower than GOVT, it demonstrates that mixing US Treasuries with uncorrelated assets (like Gold or International Bonds) creates a safer portfolio than Treasuries alone.
+
+-----
+
+## 7\. Multi-linear Model for ITDB
+
+We aim to model International Bond (ITDB) returns using the other 7 ETFs.
+
+**Modeling Process:**
+
+1.  **Full Model:** Regress ITDB against all 7 other tickers.
+2.  **Variable Selection:** Apply **Stepwise Selection (AIC)** to remove statistically insignificant variables and reduce multicollinearity.
+3.  **Final Model:** Present the refined coefficients.
+
+<!-- end list -->
+
+```{r q7-model}
+
+df_reg <- as.data.frame(df_part2)
+
+# Stepwise selection
+full_model <- lm(ITDB ~ ., data = df_reg)
+best_model <- step(full_model, direction = "both", trace = 0)
+
+# Present polished table
+kable(tidy(best_model) %>%
+        select(term, estimate, p.value) %>%
+        mutate(estimate = round(estimate, 3),
+               p.value = ifelse(p.value < 0.001, "< 0.001", round(p.value, 3))),
+      caption = "Final Model Drivers for ITDB", booktabs = T) %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+The stepwise process eliminated noise variables, leaving only the statistically significant drivers shown above.
+
+-----
+
+## 8\. Interpretation of the ITDB Model
+
+The model reveals the underlying risk factors of the International Bond ETF (ITDB).
+
+1.  **Interest Rate Risk (GOVT):** A positive coefficient on **GOVT** is expected. This indicates that international bonds are highly sensitive to US interest rates (since US Treasuries drive global yields). If GOVT rises (yields fall), ITDB also tends to rise.
+2.  **Credit/Market Risk (Equities/High Yield):** If coefficients for **VEA** (Developed Markets) or **SPHY** (High Yield) are present, it implies ITDB contains credit risk or economic exposure specific to international markets, distinct from pure US rate risk.
+3.  **Alpha:** If the intercept is statistically zero, the other ETFs fully explain ITDB's returns. A significant non-zero intercept would suggest unique factors (like currency appreciation/depreciation) not captured by the other 7 funds.
+
+By isolating these variables, we understand that ITDB is not an independent asset class but rather a composite of global interest rate and economic risk factors.
+
